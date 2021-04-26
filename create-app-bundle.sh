@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "Building AutoRaise.app" && \
-rm -r AutoRaise && \
+rm -rf AutoRaise && \
 rm -rf AutoRaise.app && \
 g++ -O2 -Wall -fobjc-arc -o AutoRaise AutoRaise.mm -framework AppKit && \
 mkdir -p AutoRaise.app/Contents/MacOS && \
