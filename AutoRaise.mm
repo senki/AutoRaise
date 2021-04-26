@@ -24,9 +24,20 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <Foundation/Foundation.h>
 #include <AppKit/AppKit.h>
+#include <Carbon/Carbon.h>
 
-extern "C" AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *out) __attribute__((weak_import));
+typedef int CGSConnectionID;
+static float oldScale = 1;
+static float cursorScale = 2;
+static bool activated_by_task_switcher = false;
+extern "C" CGSConnectionID CGSMainConnectionID(void);
+extern "C" CGError CGSSetCursorScale(CGSConnectionID connectionId, float scale);
+extern "C" CGError CGSGetCursorScale(CGSConnectionID connectionId, float *scale);
+extern "C" AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *out);
+// Above methods are undocumented and subjective to incompatible changes
+
 static AXUIElementRef _accessibility_object = AXUIElementCreateSystemWide();
+static CFStringRef XQuartz = CFSTR("XQuartz");
 static CGPoint oldPoint = {0, 0};
 static bool spaceHasChanged = false;
 static bool appWasActivated = false;
@@ -124,6 +135,28 @@ AXUIElementRef get_raiseable_window(AXUIElementRef _element, CGPoint point) {
                 CFEqual(_element_role, kAXDrawerRole)) {
                 CFRelease(_element_role);
                 return _element;
+            } else if (CFEqual(_element_role, kAXApplicationRole)) { // XQuartz special case
+                pid_t application_pid;
+                if (AXUIElementGetPid(_element, &application_pid) == kAXErrorSuccess) {
+                    pid_t frontmost_pid = [[[NSWorkspace sharedWorkspace]
+                        frontmostApplication] processIdentifier];
+                    if (application_pid != frontmost_pid) {
+                        CFStringRef _applicationTitle;
+                        if (AXUIElementCopyAttributeValue(
+                            _element,
+                            kAXTitleAttribute,
+                            (CFTypeRef *) &_applicationTitle
+                        ) == kAXErrorSuccess) {
+                            if(CFEqual(_applicationTitle, XQuartz)) {
+                                activate(application_pid);
+                            }
+                            CFRelease(_applicationTitle);
+                        }
+                    }
+                }
+
+                CFRelease(_element_role);
+                CFRelease(_element);
             } else {
                 AXUIElementRef _window = NULL;
                 AXUIElementCopyAttributeValue(_element, kAXWindowAttribute, (CFTypeRef *) &_window);
@@ -230,6 +263,7 @@ public:
     ~CppClass();
     const void spaceChanged(NSNotification * notification);
     const void appActivated(NSNotification * notification);
+    void scheduleScale(float scale, float scaleDelay);
     void startTimer(float timerInterval);
     const void onTick();
 };
@@ -264,8 +298,21 @@ public:
 - (void)appActivated:(NSNotification *)notification {
     cppClass->appActivated(notification);
 }
+- (void)scheduleScale:(NSNumber *)scale :(NSNumber *)scaleDelay {
+    [self performSelector: @selector(onSetCursorScale:)
+        withObject: scale
+        afterDelay: scaleDelay.floatValue];
+    [self performSelector: @selector(onSetCursorScale:)
+        withObject: [NSNumber numberWithFloat: oldScale]
+        afterDelay: scaleDelay.floatValue*3];
+}
+- (void)onSetCursorScale:(NSNumber *)scale {
+    CGSSetCursorScale(CGSMainConnectionID(), scale.floatValue);
+}
 - (void)onTick:(NSNumber *)timerInterval {
-    [self performSelector:@selector(onTick:) withObject:timerInterval afterDelay:timerInterval.floatValue];
+    [self performSelector: @selector(onTick:)
+        withObject: timerInterval
+        afterDelay: timerInterval.floatValue];
     cppClass->onTick();
 }
 @end
@@ -277,48 +324,153 @@ CppClass::~CppClass() {}
 void CppClass::startTimer(float timerInterval) {
     [(MDWorkspaceWatcher *) workspaceWatcher onTick: [NSNumber numberWithFloat: timerInterval]];
 }
+void CppClass::scheduleScale(float scale, float scaleDelay) {
+    [(MDWorkspaceWatcher *) workspaceWatcher scheduleScale:
+        [NSNumber numberWithFloat: scale]:
+        [NSNumber numberWithFloat: scaleDelay]];
+}
 const void CppClass::spaceChanged(NSNotification * notification) {
     spaceHasChanged = true;
     oldPoint.x = oldPoint.y = 0;
 }
 
-//------------------------------------------where it all happens--------------------------------------------
+//----------------------------------------------configuration-----------------------------------------------
 
-const void CppClass::appActivated(NSNotification * notification) {
-    CGEventRef _event = CGEventCreate(NULL);
-    CGPoint mousePoint = CGEventGetLocation(_event);
-    if (_event) { CFRelease(_event); }
+const NSString *kDelay = @"delay";
+const NSString *kWarpX = @"warpX";
+const NSString *kWarpY = @"warpY";
+const NSString *kScale = @"scale";
+NSArray *parametersDictionary = @[kDelay, kWarpX, kWarpY, kScale];
+NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
 
-    bool mouseMoved = fabs(mousePoint.x-oldPoint.x) > 0;
-    mouseMoved = mouseMoved || fabs(mousePoint.y-oldPoint.y) > 0;
-    if (mouseMoved) { return; }
+@interface ConfigClass:NSObject
+- (NSString *) getFilePath:(NSString *) filename;
+- (void) readConfig:(int) argc;
+- (void) readOriginalConfig;
+- (void) readHiddenConfig;
+- (void) validateParameters;
+@end
 
-    appWasActivated = true;
-    pid_t application_pid = ((NSRunningApplication *) ((NSWorkspace *)
-        notification.object).frontmostApplication).processIdentifier;
+@implementation ConfigClass
 
-    AXUIElementRef _mouseWindow = get_mousewindow(mousePoint);
-    if (_mouseWindow) {
-        bool needs_warp = true;
-        pid_t mouseWindow_pid;
-        if (AXUIElementGetPid(_mouseWindow, &mouseWindow_pid) == kAXErrorSuccess) {
-            needs_warp = mouseWindow_pid != application_pid;
+- (NSString *) getFilePath:(NSString *) filename {
+    filename = [NSString stringWithFormat: @"%@/%@", NSHomeDirectory(), filename];
+    if (not [[NSFileManager defaultManager] fileExistsAtPath: filename]) { filename = NULL; }
+    return filename;
+}
+
+- (void) readConfig:(int) argc {
+    if (argc > 1) {
+        // read NSArgumentDomain
+        NSUserDefaults *arguments = [NSUserDefaults standardUserDefaults];
+
+        for (id key in parametersDictionary) {
+            id arg = [arguments objectForKey: key];
+            if (arg != NULL) { parameters[key] = arg; }
+        }
+    } else {
+        [self readOriginalConfig];
+    }
+    return;
+}
+
+- (void) readOriginalConfig {
+    // original config files:
+    NSString *delayFilePath = [self getFilePath: @"AutoRaise.delay"];
+    NSString *warpFilePath = [self getFilePath: @"AutoRaise.warp"];
+
+    if (delayFilePath || warpFilePath) {
+        NSFileHandle *hDelayFile = [NSFileHandle fileHandleForReadingAtPath: delayFilePath];
+        if (hDelayFile) {
+            parameters[kDelay] = @(abs([[[NSString alloc]
+                initWithData: [hDelayFile readDataOfLength: 2]
+                encoding: NSUTF8StringEncoding] intValue]));
+            [hDelayFile closeFile];
         }
 
-        if (needs_warp) {
-            CFTypeRef _focusedWindow = NULL;
-            AXUIElementRef _focusedApp = AXUIElementCreateApplication(application_pid);
-            AXUIElementCopyAttributeValue(
-                (AXUIElementRef) _focusedApp,
-                kAXFocusedWindowAttribute,
-                &_focusedWindow);
-            CFRelease(_focusedApp);
-            if (_focusedWindow) {
-                CGWarpMouseCursorPosition(get_mousepoint((AXUIElementRef) _focusedWindow));
-                CFRelease(_focusedWindow);
+        NSFileHandle *hWarpFile = [NSFileHandle fileHandleForReadingAtPath: warpFilePath];
+        if (hWarpFile) {
+            NSString *line = [[NSString alloc]
+                initWithData: [hWarpFile readDataOfLength:11]
+                encoding: NSUTF8StringEncoding];
+            NSArray *components = [line componentsSeparatedByString: @" "];
+            if (components.count >= 1) { parameters[kWarpX] = @([[components objectAtIndex:0] floatValue]); }
+            if (components.count >= 2) { parameters[kWarpY] = @([[components objectAtIndex:1] floatValue]); }
+            if (components.count >= 3) { parameters[kScale] = @([[components objectAtIndex:2] floatValue]); }
+            [hWarpFile closeFile];
+        }
+    } else {
+        [self readHiddenConfig];
+    }
+    return;
+}
+
+- (void) readHiddenConfig {
+    // search for dotfiles
+    NSString *hiddenConfigFilePath = [self getFilePath: @".AutoRaise"];
+    if (!hiddenConfigFilePath) { hiddenConfigFilePath = [self getFilePath: @".config/AutoRaise/config"]; }
+    
+    if (hiddenConfigFilePath) {
+        NSError *error;
+        NSString *configContent = [[NSString alloc]
+            initWithContentsOfFile: hiddenConfigFilePath
+            encoding: NSUTF8StringEncoding error: &error];
+        
+        // remove all whitespaces from file
+        configContent = [configContent stringByReplacingOccurrencesOfString:@" " withString:@""];
+        NSArray *configLines = [configContent componentsSeparatedByString:@"\n"];
+        NSArray *components;
+        for (NSString *line in configLines) {
+            if (not [line hasPrefix:@"#"]) {
+                components = [line componentsSeparatedByString:@"="];
+                if ([components count] == 2) {
+                    for (id key in parametersDictionary) {
+                        if ([components[0] isEqual: key]) { parameters[key] = components[1]; }
+                    }
+                }
             }
         }
-        CFRelease(_mouseWindow);
+    }
+    return;
+}
+
+- (void) validateParameters {
+    // validate and fix wrong/absent parameters
+    if ([parameters[kDelay] intValue] < 1) { parameters[kDelay] = @"2"; }
+    if ([parameters[kScale] floatValue] < 1) { parameters[kScale] = @"2.0"; }
+    warpMouse =
+        parameters[kWarpX] && [parameters[kWarpX] floatValue] >= 0 && [parameters[kWarpX] floatValue] <= 1 &&
+        parameters[kWarpY] && [parameters[kWarpY] floatValue] >= 0 && [parameters[kWarpY] floatValue] <= 1;
+    return;
+}
+
+@end
+
+//------------------------------------------where it all happens--------------------------------------------
+
+#define SCALEDELAY_MS 300
+const void CppClass::appActivated(NSNotification * notification) {
+    if (!activated_by_task_switcher) { return; }
+    activated_by_task_switcher = false;
+    appWasActivated = true;
+
+    pid_t focusedApp_pid = ((NSRunningApplication *) notification.userInfo[
+        NSWorkspaceApplicationKey]).processIdentifier;
+    AXUIElementRef _focusedWindow = NULL;
+    AXUIElementRef _focusedApp = AXUIElementCreateApplication(focusedApp_pid);
+    AXUIElementCopyAttributeValue(
+        (AXUIElementRef) _focusedApp,
+        kAXFocusedWindowAttribute,
+        (CFTypeRef *) &_focusedWindow);
+    CFRelease(_focusedApp);
+
+    if (_focusedWindow) {
+        CGWarpMouseCursorPosition(get_mousepoint((AXUIElementRef) _focusedWindow));
+        CFRelease(_focusedWindow);
+    }
+
+    if (cursorScale != oldScale) {
+        scheduleScale(cursorScale, SCALEDELAY_MS/1000.0);
     }
 }
 
@@ -370,8 +522,9 @@ const void CppClass::onTick() {
             pid_t mouseWindow_pid;
             if (AXUIElementGetPid(_mouseWindow, &mouseWindow_pid) == kAXErrorSuccess) {
                 Boolean needs_raise = true;
-                pid_t frontmost = [[[NSWorkspace sharedWorkspace] frontmostApplication] processIdentifier];
-                AXUIElementRef _focusedApp = AXUIElementCreateApplication(frontmost);
+                pid_t frontmost_pid = [[[NSWorkspace sharedWorkspace]
+                    frontmostApplication] processIdentifier];
+                AXUIElementRef _focusedApp = AXUIElementCreateApplication(frontmost_pid);
                 if (_focusedApp) {
                     AXUIElementRef _focusedWindow = NULL;
                     AXUIElementCopyAttributeValue(
@@ -418,50 +571,52 @@ const void CppClass::onTick() {
     }
 }
 
+CGEventRef eventTapHandler(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *userInfo) {
+    static bool commandTabPressed = false;
+    activated_by_task_switcher = type == kCGEventFlagsChanged && commandTabPressed;
+    commandTabPressed = false;
+    if (type == kCGEventKeyUp) {
+        CGKeyCode keycode = (CGKeyCode) CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (keycode == kVK_Tab) {
+            CGEventFlags flags = CGEventGetFlags(event);
+            commandTabPressed = (flags & kCGEventFlagMaskCommand) == kCGEventFlagMaskCommand;
+        }
+    }
+
+    return event;
+}
+
 #define POLLING_MS 20
+#define VERSION "1.9"
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
-        if (argc >= 3) {
-            NSUserDefaults * standardDefaults = [NSUserDefaults standardUserDefaults];
-            delayCount = abs((int) [standardDefaults integerForKey: @"delay"]);
-            warpMouse = argc != 3 ;
-            if (argc >= 7) {
-                warpX = [standardDefaults floatForKey: @"warpX"];
-                warpY = [standardDefaults floatForKey: @"warpY"];
-            }
-        } else {
-            NSString * home = NSHomeDirectory();
-            NSFileHandle * delayFile = [NSFileHandle fileHandleForReadingAtPath:
-                [NSString stringWithFormat: @"%@/AutoRaise.delay", home]];
-            if (delayFile) {
-                delayCount = abs([[[NSString alloc] initWithData:
-                    [delayFile readDataOfLength: 2] encoding:
-                    NSUTF8StringEncoding] intValue]);
-                [delayFile closeFile];
-            }
-            NSFileHandle * warpFile = [NSFileHandle fileHandleForReadingAtPath:
-                [NSString stringWithFormat: @"%@/AutoRaise.warp", home]];
-            if (warpFile) {
-                warpMouse = true;
-                NSString * line = [[NSString alloc] initWithData:
-                    [warpFile readDataOfLength:7] encoding:
-                    NSUTF8StringEncoding];
-                NSArray * components = [line componentsSeparatedByString: @" "];
-                if (components.count) {
-                    warpX = [components.firstObject floatValue];
-                    warpY = [components.lastObject floatValue];
-                }
-                [warpFile closeFile];
-            }
-        }
-        if (!delayCount) { delayCount = 2; }
+        printf("\nv%s by sbmpost(c) 2021, usage:\nAutoRaise -delay <1=%dms> [-warpX <0.5> -warpY <0.5> -scale <2.0>]", VERSION, POLLING_MS);
+        
+        ConfigClass * config = [[ConfigClass alloc] init];
+        [config readConfig: argc];
+        [config validateParameters];
 
-        printf("\nBy sbmpost(c) 2021, usage:\nAutoRaise -delay <1=%dms> [-warpX <0.5> -warpY <0.5>]"
-               "\nStarted with %d ms delay%s", POLLING_MS, delayCount*POLLING_MS, warpMouse ? ", " : "\n");
-        if (warpMouse) { printf("warpX: %.1f, warpY: %.1f\n", warpX, warpY); }
+        delayCount  = [parameters[@"delay"] intValue];
+        warpX       = [parameters[@"warpX"] floatValue];
+        warpY       = [parameters[@"warpY"] floatValue];
+        cursorScale = [parameters[@"scale"] floatValue];
+
+        printf("\nStarted with %d ms delay%s", delayCount*POLLING_MS, warpMouse ? ", " : "\n");
+        if (warpMouse) { printf("warpX: %.1f, warpY: %.1f, scale: %.1f\n", warpX, warpY, cursorScale); }
 
         NSDictionary * options = @{(id) CFBridgingRelease(kAXTrustedCheckOptionPrompt): @YES};
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef) options);
+
+        CGSGetCursorScale(CGSMainConnectionID(), &oldScale);
+        CFMachPortRef eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0,
+            (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged), eventTapHandler, NULL);
+        if (eventTap) {
+            CFRunLoopSourceRef runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
+            if (runLoopSource) {
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+                CGEventTapEnable(eventTap, true);
+            }
+        }
 
         CppClass cppClass = CppClass();
         cppClass.startTimer(POLLING_MS/1000.0);
